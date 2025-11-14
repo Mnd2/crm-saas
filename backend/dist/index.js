@@ -1,0 +1,37 @@
+"use strict";
+var __importDefault = (this && this.__importDefault) || function (mod) {
+    return (mod && mod.__esModule) ? mod : { "default": mod };
+};
+Object.defineProperty(exports, "__esModule", { value: true });
+const express_1 = __importDefault(require("express"));
+const cors_1 = __importDefault(require("cors"));
+const morgan_1 = __importDefault(require("morgan"));
+const env_1 = require("./config/env");
+const auth_1 = __importDefault(require("./routes/auth"));
+const contacts_1 = __importDefault(require("./routes/contacts"));
+const deals_1 = __importDefault(require("./routes/deals"));
+const activities_1 = __importDefault(require("./routes/activities"));
+const organizations_1 = __importDefault(require("./routes/organizations"));
+const users_1 = __importDefault(require("./routes/users"));
+const analytics_1 = __importDefault(require("./routes/analytics"));
+const ai_1 = __importDefault(require("./routes/ai"));
+const prestashop_1 = __importDefault(require("./routes/prestashop"));
+const email_1 = __importDefault(require("./routes/email"));
+const app = (0, express_1.default)();
+app.use((0, cors_1.default)());
+app.use(express_1.default.json());
+app.use((0, morgan_1.default)("dev"));
+app.get("/health", (_, res) => res.json({ status: "ok" }));
+app.use("/api/v1/auth", auth_1.default);
+app.use("/api/v1/contacts", contacts_1.default);
+app.use("/api/v1/deals", deals_1.default);
+app.use("/api/v1/activities", activities_1.default);
+app.use("/api/v1/organizations", organizations_1.default);
+app.use("/api/v1/users", users_1.default);
+app.use("/api/v1/analytics", analytics_1.default);
+app.use("/api/v1/ai", ai_1.default);
+app.use("/api/v1/prestashop", prestashop_1.default);
+app.use("/api/v1/email", email_1.default);
+app.listen(env_1.env.PORT, () => {
+    console.log(`Backend running on port ${env_1.env.PORT}`);
+});

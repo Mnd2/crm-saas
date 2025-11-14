@@ -1,5 +1,6 @@
 import { Router } from "express";
 import axios from "axios";
+import { Activity, Contact, Deal } from "@prisma/client";
 import { prisma } from "../config/prisma";
 import { authMiddleware } from "../middleware/auth";
 import { env } from "../config/env";
@@ -16,6 +17,118 @@ interface LeadScoreRequest {
   pageViews?: number;
   daysSinceLastOrder?: number;
   daysSinceLastActivity?: number;
+}
+
+type ContactWithRelations = Contact & {
+  deals: Deal[];
+  activities: Activity[];
+  owner?: {
+    firstName: string | null;
+    lastName: string | null;
+  } | null;
+};
+
+interface ContactMetrics {
+  lastOrderAmount: number;
+  totalOrders: number;
+  daysSinceLastOrder: number | null;
+  daysSinceLastActivity: number | null;
+}
+
+const DEFAULT_CHAT_SYSTEM_PROMPT = [
+  "Tu esi CRM asistentas.",
+  "Atsakyk lietuviskai, konkreciai ir prie esmes.",
+  "Jei truksta duomenu, pirmiausia paprasyk paaiskinimo vietoje spejimu.",
+  "Remkis tik tuo, ka pateikia naudotojas arba CRM kontekstas.",
+].join(" ");
+
+const OUTREACH_SYSTEM_PROMPT = [
+  "Veiki kaip vyresnysis account manager'is, kuris raso atsakymus klientams.",
+  "Tonacija profesionali, draugiska ir orientuota i verslo tiksla.",
+  "Lietuviska kalba, aiskus kvietimas veikti ir konkretus tolesnis zingsnis.",
+  "Nenaudok bendru fraziu, personalizuok turini remdamasis CRM kontekstu.",
+].join(" ");
+
+function diffInDays(date?: Date | null) {
+  if (!date) return null;
+  const value = date instanceof Date ? date : new Date(date);
+  return Math.round((Date.now() - value.getTime()) / (1000 * 60 * 60 * 24));
+}
+
+function resolveContactName(contact: Contact) {
+  const parts = [contact.firstName, contact.lastName].filter(Boolean).join(" ").trim();
+  return parts || contact.email || "Nezinomas kontaktas";
+}
+
+function computeContactMetrics(contact: ContactWithRelations): ContactMetrics {
+  const dealsSorted = [...contact.deals].sort(
+    (a, b) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime()
+  );
+  const wonDeals = dealsSorted.filter((deal) => deal.stage === "won");
+  const referenceDeal = wonDeals[0] || dealsSorted[0];
+  return {
+    lastOrderAmount: referenceDeal?.amount ?? 0,
+    totalOrders: wonDeals.length,
+    daysSinceLastOrder: referenceDeal
+      ? diffInDays(referenceDeal.updatedAt || referenceDeal.createdAt)
+      : null,
+    daysSinceLastActivity: contact.activities.length
+      ? diffInDays(contact.activities[0].createdAt)
+      : null,
+  };
+}
+
+function buildContactSnapshot(contact: ContactWithRelations, metrics: ContactMetrics) {
+  const ownerName = contact.owner
+    ? [contact.owner.firstName, contact.owner.lastName].filter(Boolean).join(" ").trim()
+    : "";
+  const lines = [
+    `Vardas: ${resolveContactName(contact)}`,
+    `El. pastas: ${contact.email || "-"}`,
+    `Imone: ${contact.company || "-"}`,
+    `Telefonas: ${contact.phone || "-"}`,
+    `Lifecycle stage: ${contact.lifecycleStage || "-"}`,
+  ];
+  if (ownerName) {
+    lines.push(`Atsakingas vadybininkas: ${ownerName}`);
+  }
+  if (contact.tags?.length) {
+    lines.push(`Zymes: ${contact.tags.join(", ")}`);
+  }
+  lines.push(
+    `Paskutinio uzsakymo suma: ${metrics.lastOrderAmount.toFixed(2)} EUR`,
+    `VISO uzsakymu: ${metrics.totalOrders}`,
+    `Dienos nuo paskutinio uzsakymo: ${metrics.daysSinceLastOrder ?? "-"}`,
+    `Dienos nuo paskutinio kontakto: ${metrics.daysSinceLastActivity ?? "-"}`
+  );
+  return lines.join("\n");
+}
+
+function summarizeDealsForPrompt(deals: Deal[]) {
+  if (!deals.length) {
+    return "- Nera aktyviu sandoriu.";
+  }
+  return deals
+    .slice(0, 5)
+    .map((deal) => {
+      const amount =
+        typeof deal.amount === "number" ? `${deal.amount.toFixed(2)} ${deal.currency}` : "suma nenurodyta";
+      return `- ${deal.title} (${deal.stage}, ${amount})`;
+    })
+    .join("\n");
+}
+
+function summarizeActivitiesForPrompt(activities: Activity[]) {
+  if (!activities.length) {
+    return "- Nera registruotu veiklu.";
+  }
+  return activities
+    .slice(0, 5)
+    .map((activity) => {
+      const subject = activity.subject ? ` - ${activity.subject}` : "";
+      return `- ${activity.type}${subject} (${activity.completed ? "uzbaigta" : "atvira"})`;
+    })
+    .join("\n");
 }
 
 async function callGroq(messages: any[], model?: string) {
@@ -72,9 +185,7 @@ router.post("/chat", async (req, res) => {
   const messages = [
     {
       role: "system",
-      content:
-        system ||
-        "Tu esi draugiškas CRM asistentas. Atsakyk glaustai ir lietuviškai.",
+      content: system || DEFAULT_CHAT_SYSTEM_PROMPT,
     },
     {
       role: "user",
@@ -100,8 +211,8 @@ router.post("/chat", async (req, res) => {
       error?.response?.data?.error?.code === "model_decommissioned";
     if (isTimeout || isProviderIssue) {
       const fallback =
-        "Sveiki,\n\nŠiuo metu AI servisai neatsako. Pabandyk dar kartą po kelių sekundžių.\n\n" +
-        "Jei reikia greito atsakymo, trumpai sureaguok rankiniu būdu.\n";
+        "Sveiki,\n\nSiuo metu AI servisas trumpam nepasiekiamas. Pabandyk dar karta po keliu akimirku.\n\n" +
+        "Jei reikia skubaus atsakymo, reaguok rankiniu budu.\n";
       return res.json({ reply: fallback, fallback: true });
     }
     res.status(500).json({
@@ -123,42 +234,64 @@ router.post("/generate-reply", async (req, res) => {
   };
 
   if (!contactId || !prompt?.trim()) {
-    return res.status(400).json({ message: "Trūksta kontakto arba prompt" });
+    return res.status(400).json({ message: "Truksta kontakto arba prompt" });
   }
 
   const contact = await prisma.contact.findFirst({
     where: { id: contactId, organizationId },
+    include: {
+      owner: {
+        select: { firstName: true, lastName: true },
+      },
+      deals: {
+        orderBy: { updatedAt: "desc" },
+      },
+      activities: {
+        orderBy: { createdAt: "desc" },
+        take: 5,
+      },
+    },
   });
 
   if (!contact) {
     return res.status(404).json({ message: "Kontaktas nerastas" });
   }
 
-  const systemPrompt =
-    "Tu esi pardavimų atstovas. Paruošk trumpą, profesionalų lietuvišką laiško atsakymą klientui.";
+  const extendedContact = contact as ContactWithRelations;
+  const metrics = computeContactMetrics(extendedContact);
+  const contactSnapshot = buildContactSnapshot(extendedContact, metrics);
+  const dealsSummary = summarizeDealsForPrompt(extendedContact.deals);
+  const activitiesSummary = summarizeActivitiesForPrompt(extendedContact.activities);
+  const userPrompt = [
+    "CRM kontekstas:",
+    contactSnapshot,
+    "",
+    "Paskutiniai deal'ai:",
+    dealsSummary,
+    "",
+    "Paskutines veiklos:",
+    activitiesSummary,
+    "",
+    "Kliento zinute ar papildomas kontekstas:",
+    prompt.trim(),
+    "",
+    "Uzdotis: paruos profesionalu atsakyma lietuviskai (2-3 pastraipos) su aiskia rekomendacija arba veiksmo kvietimu. Jei truksta duomenu, pasiulyk ko reikia, bet neisigalvok faktu.",
+  ].join("\n");
 
   try {
     const result = await generateWithLLM([
-      { role: "system", content: systemPrompt },
+      { role: "system", content: OUTREACH_SYSTEM_PROMPT },
       {
         role: "user",
-        content: `Kontaktas: ${contact.firstName || ""} ${
-          contact.lastName || ""
-        } (${contact.email || "be el. pašto"}).
-
-Kontekstas: ${prompt}`,
+        content: userPrompt,
       },
     ]);
-
     res.json(result);
   } catch (error: any) {
-    console.error(
-      "OpenRouter generate-reply error",
-      error?.response?.data || error?.message
-    );
+    console.error("generate-reply error", error?.response?.data || error?.message);
     if (error?.message === "NO_AI_CONFIGURED") {
       return res.status(400).json({
-        message: "AI integracija nesukonfigūruota. Įrašyk GROQ_API_KEY.",
+        message: "AI integracija nesukonfiguruota. Nurodyk GROQ_API_KEY.",
       });
     }
     const isTimeout =
@@ -171,12 +304,12 @@ Kontekstas: ${prompt}`,
     if (isTimeout || isProviderIssue) {
       const fallback = `Sveiki,
 
-Deja, AI servisas neatsakė laiku, tačiau gali panaudoti šį juodraštį kaip atspirties tašką:
+Deja, AI servisas neatsake laiku. Pabandyk dar karta po keliu akimirku arba pasinaudok sia istrauka:
 
 ${prompt}
 
 Pagarbiai,
-Tavo komanda`;
+CRM komanda`;
       return res.json({ reply: fallback, fallback: true });
     }
     res.status(500).json({
@@ -270,7 +403,12 @@ router.get("/contact/:id/next-action", async (req, res) => {
   const contact = await prisma.contact.findFirst({
     where: { id, organizationId },
     include: {
-      deals: true,
+      owner: {
+        select: { firstName: true, lastName: true },
+      },
+      deals: {
+        orderBy: { updatedAt: "desc" },
+      },
       activities: {
         orderBy: { createdAt: "desc" },
         take: 5,
@@ -282,50 +420,145 @@ router.get("/contact/:id/next-action", async (req, res) => {
     return res.status(404).json({ message: "Kontaktas nerastas" });
   }
 
+  const extendedContact = contact as ContactWithRelations;
+  const metrics = computeContactMetrics(extendedContact);
+
   let score = 50;
   const reasons: string[] = [];
   const suggestedActions: string[] = [];
 
-  if (contact.deals.some((d) => d.stage === "won")) {
+  if (extendedContact.deals.some((d) => d.stage === "won")) {
     score += 20;
-    reasons.push("Turi laimėtų sandorių");
+    reasons.push("Turi laimetu sandoriu");
   }
 
-  const lastActivity = contact.activities[0];
+  if (metrics.totalOrders > 1) {
+    score += 10;
+    reasons.push("Istoriskai pirko ne karta");
+  }
+
+  if (metrics.daysSinceLastOrder !== null) {
+    if (metrics.daysSinceLastOrder <= 30) {
+      score += 10;
+      reasons.push("Neseniai pirko");
+    } else if (metrics.daysSinceLastOrder > 120) {
+      score -= 10;
+      reasons.push("Seniai nebuvome sandoryje");
+    }
+  }
+
+  if (extendedContact.lifecycleStage === "customer") {
+    score += 10;
+    reasons.push("Esamas klientas");
+  } else if (
+    extendedContact.lifecycleStage &&
+    extendedContact.lifecycleStage.toLowerCase().includes("churn")
+  ) {
+    score -= 15;
+    reasons.push("Pazymetas kaip churn rizika");
+  }
+
+  if (extendedContact.tags?.includes("vip")) {
+    score += 15;
+    reasons.push("VIP zyma");
+  }
+
+  const openDeals = extendedContact.deals.filter((deal) =>
+    ["proposal", "negotiation", "qualified"].includes(deal.stage)
+  );
+  if (openDeals.length) {
+    score += 10;
+    reasons.push("Yra aktyviu deal'u");
+    suggestedActions.push(
+      `Sekti deal'a "${openDeals[0].title}" ir pajudinti etapa`
+    );
+  }
+
+  const lastActivity = extendedContact.activities[0];
   if (!lastActivity) {
     score += 10;
-    reasons.push("Dar nebuvo jokio veiksmo – verta susisiekti");
+    reasons.push("Dar nebuvo jokio veiksmo - verta susisiekti");
     suggestedActions.push("Paskambinti ir prisistatyti");
   } else {
-    const days =
-      (Date.now() - new Date(lastActivity.createdAt).getTime()) /
-      (1000 * 60 * 60 * 24);
-    if (days > 30) {
-      score += 10;
+    const daysSinceLastActivity =
+      metrics.daysSinceLastActivity ??
+      Math.round(
+        (Date.now() - new Date(lastActivity.createdAt).getTime()) /
+          (1000 * 60 * 60 * 24)
+      );
+    if (daysSinceLastActivity > 45) {
+      score -= 10;
       reasons.push("Seniai buvo kontaktas");
-      suggestedActions.push("Išsiųsti follow-up el. laišką");
+      suggestedActions.push("Issiusti follow-up el. laiska");
+    } else if (daysSinceLastActivity > 14) {
+      reasons.push("Kontaktas nebuvo apklaustas kelias savaites");
+      suggestedActions.push("Priminti apie pasiulyta verte el. laisku");
     } else {
       reasons.push("Neseniai buvo kontaktas");
     }
   }
+
+  if (
+    !extendedContact.deals.length &&
+    (!extendedContact.lifecycleStage || extendedContact.lifecycleStage === "lead")
+  ) {
+    suggestedActions.push("Pakviesti i demo arba konsultacija");
+  }
+
+  if (score < 0) score = 0;
+  if (score > 100) score = 100;
 
   let priority: "low" | "medium" | "high" = "medium";
   if (score >= 75) priority = "high";
   else if (score <= 40) priority = "low";
 
   if (priority === "high") {
-    suggestedActions.push(
-      "Skambutis šiandien",
-      "Pasiūlyti upsell arba cross-sell"
-    );
+    suggestedActions.push("Skambutis siandien", "Pasiulyti upsell arba cross-sell");
   }
 
+  const dealsForUi = extendedContact.deals.slice(0, 5).map((deal) => ({
+    id: deal.id,
+    title: deal.title,
+    amount: deal.amount,
+    currency: deal.currency,
+    stage: deal.stage,
+    createdAt: deal.createdAt,
+  }));
+
+  const activitiesForUi = extendedContact.activities.slice(0, 5).map((activity) => ({
+    id: activity.id,
+    type: activity.type,
+    subject: activity.subject,
+    dueDate: activity.scheduledAt ? activity.scheduledAt.toISOString() : null,
+    completed: activity.completed,
+    createdAt: activity.createdAt,
+  }));
+
   res.json({
+    contactId: extendedContact.id,
+    contactName: resolveContactName(extendedContact),
+    email: extendedContact.email,
+    phone: extendedContact.phone,
+    company: extendedContact.company,
+    lifecycleStage: extendedContact.lifecycleStage,
+    tags: extendedContact.tags || [],
+    metrics,
     score,
     priority,
     reasons,
     suggestedActions,
+    deals: dealsForUi,
+    activities: activitiesForUi,
   });
 });
 
+
+
 export default router;
+
+
+
+
+
+
+

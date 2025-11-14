@@ -26,7 +26,10 @@ interface NextActionResponse {
   contactId: string;
   contactName: string;
   email: string | null;
-  lifecycleStage: string;
+  phone: string | null;
+  company: string | null;
+  lifecycleStage: string | null;
+  tags: string[];
   metrics: {
     lastOrderAmount: number;
     totalOrders: number;
@@ -107,19 +110,22 @@ export default function ContactDetail() {
   }, [data]);
 
   const generateReply = async () => {
-    if (!data || !aiPrompt.trim()) return;
+    if (!data?.contactId || !aiPrompt.trim()) {
+      setAiError("Truksta kontakto duomenu arba konteksto");
+      return;
+    }
     setAiError("");
     setAiReply("");
     setAiLoading(true);
     try {
-      const res = await api.post("/ai/chat", {
-        prompt: `Kontaktas ${data.contactName} (${data.email || "be el. pašto"}).
-
-Paruošk draugišką, profesionalų atsakymą į laišką. Kontekstas:
-${aiPrompt}
-`
+      const res = await api.post("/ai/generate-reply", {
+        contactId: data.contactId,
+        prompt: aiPrompt.trim()
       });
       setAiReply(res.data.reply || "");
+      if (res.data.fallback) {
+        setAiError("AI atsakymą sugeneravo naudodamas laikina juodrašti.");
+      }
     } catch (e: any) {
       setAiError(e?.response?.data?.message || "Nepavyko sugeneruoti atsakymo");
     } finally {
